@@ -18,7 +18,6 @@ async def callback(request: Request):
 # main.py
 import os, time, json
 from collections import deque
-import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
 
@@ -34,7 +33,7 @@ pending = deque(maxlen=BUFFER_MAX)
 # Health check endpoint to verify the service is running
 @app.get("/")
 def health():
-    return PlainTextResponse("ok")
+    return PlainTextResponse("Endpoint is available")
 
 # Record data from HH redirections 
 @app.get("/hh/callback")
@@ -74,6 +73,6 @@ def admin_dequeue(admin_token: str, state: str):
     for item in pending:
         if item["state"] == state:
             pending.remove(item)
-            return JSONResponse(item)
+            return PlainTextResponse(f"Data for state {state} has been removed: {json.dumps(item)}")
     
     raise HTTPException(status_code=404, detail="State not found in queue")
