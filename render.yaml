@@ -3,11 +3,26 @@ services:
     name: hrvibe_h_callback_endpoint
     env: python
     plan: free
-    buildCommand: |
-      pip install -r requirements.txt
-    startCommand: |
-      uvicorn main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    # Build & run
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # Environment
     envVars:
+      # Secrets (set in Render dashboard after first deploy or keep generateValue)
       - key: ADMIN_TOKEN
         sync: false
-
+      - key: BOT_SHARED_SECRET
+        sync: false
+      # HH OAuth app credentials (set values in dashboard; do NOT commit)
+      - key: HH_CLIENT_ID
+        sync: false
+      - key: HH_CLIENT_SECRET
+        sync: false
+      # OAuth endpoints and redirect URI
+      - key: HH_REDIRECT_URI
+        value: https://hrvibe-hh-callback-endpoint.onrender.com/hh/callback
+      - key: HH_TOKEN_URL
+        value: https://hh.ru/oauth/token
+      - key: USER_AGENT
+        value: "kadryonline-hhbot/0.1 (gdavydovvv@gmail.com)"

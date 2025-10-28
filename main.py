@@ -27,6 +27,7 @@ pending = deque(maxlen=BUFFER_MAX)          # raw callback hits (for audit)
 tokens: Dict[str, Dict] = {}
 
 # --- Models ---
+#Required for parsing the request body (JSON)
 class StatePayload(BaseModel):
     state: str
 
@@ -121,13 +122,15 @@ def require_bot(auth_header: Optional[str]):
 
 # --- Endpoints ---
 
-# Health check endpoint to verify the service is running
+
 @app.get("/")
+# Health check endpoint to verify the service is running
 def health():
     return PlainTextResponse("Endpoint is available")
 
-# HH redirect target: /hh/callback?code=...&state=...
+
 @app.get("/hh/callback")
+# HH redirect target: /hh/callback?code=...&state=...
 async def hh_callback(request: Request):
     # Capture code and state from request query parameters
     code  = request.query_params.get("code")
@@ -160,8 +163,10 @@ async def hh_callback(request: Request):
         # keep the pending record, but don’t store tokens
         return PlainTextResponse(f"Ошибка авторизации: {str(e)}", status_code=500)
 
-# Bot → Render: return a valid access token for a given state (refreshing if needed)
+
+"""
 @app.post("/token/by-state")
+# Bot → Render: return a valid access token for a given state (refreshing if needed)
 # payload: StatePayload -> comes from the request body (JSON)
 # authorization: Optional[str] = Header(None) -> FastAPI automatically maps that HTTP header to the Python parameter "authorization".
 async def token_by_state(payload: StatePayload, authorization: Optional[str] = Header(None)):
@@ -179,8 +184,10 @@ async def token_by_state(payload: StatePayload, authorization: Optional[str] = H
         "expires_at": item["expires_at"],
     }
 
-# Optional: one-shot dequeue/cleanup after you’ve stored the mapping user ↔ tokens elsewhere
+
+
 @app.delete("/admin/state")
+# Optional: one-shot dequeue/cleanup after you’ve stored the mapping user ↔ tokens elsewhere
 # payload: StatePayload -> comes from the request body (JSON)
 # authorization: Optional[str] = Header(None) -> FastAPI automatically maps that HTTP header to the Python parameter "admin_token".
 def admin_delete_state(payload: StatePayload, admin_token: Optional[str] = Header(None)):
@@ -193,11 +200,13 @@ def admin_delete_state(payload: StatePayload, admin_token: Optional[str] = Heade
     #If no token is not removed → "existed" = None → bool(existed) = False
     return {"deleted": bool(existed)} 
 
+
 @app.get("/admin/pending")
 def admin_pending(admin_token: Optional[str] = Header(None)):
     #check ADMIN_TOKEN in the authorization header
     require_admin(admin_token)
     return JSONResponse(list(pending))
+
 
 @app.get("/admin/tokens")
 def admin_tokens(admin_token: Optional[str] = Header(None)):
@@ -205,3 +214,5 @@ def admin_tokens(admin_token: Optional[str] = Header(None)):
     require_admin(admin_token)
     #builds and returns a JSON response showing all tokens in memory, but with their sensitive parts (access and refresh tokens) hidden by replacing them with "***".
     return JSONResponse({k: {**v, "access_token": "***", "refresh_token": "***"} for k, v in tokens.items()})
+
+"""
