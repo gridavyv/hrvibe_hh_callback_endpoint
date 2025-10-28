@@ -164,7 +164,7 @@ async def hh_callback(request: Request):
         return PlainTextResponse(f"Ошибка авторизации: {str(e)}", status_code=500)
 
 
-"""
+
 @app.post("/token/by-state")
 # Bot → Render: return a valid access token for a given state (refreshing if needed)
 # payload: StatePayload -> comes from the request body (JSON)
@@ -214,5 +214,3 @@ def admin_tokens(admin_token: Optional[str] = Header(None)):
     require_admin(admin_token)
     #builds and returns a JSON response showing all tokens in memory, but with their sensitive parts (access and refresh tokens) hidden by replacing them with "***".
     return JSONResponse({k: {**v, "access_token": "***", "refresh_token": "***"} for k, v in tokens.items()})
-
-"""
