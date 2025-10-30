@@ -1,6 +1,7 @@
-import os, time, json, hmac, hashlib
-from typing import Dict, Optional
+import os, time, json, hmac, hashlib, asyncio, tempfile
+from typing import Dict, Optional, Any
 from collections import deque
+from pathlib import Path
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -19,8 +20,16 @@ HH_REDIRECT_URI   = os.getenv("HH_REDIRECT_URI")
 HH_TOKEN_URL      = os.getenv("HH_TOKEN_URL", "https://hh.ru/oauth/token")
 USER_AGENT        = os.getenv("USER_AGENT")
 
+# Persistent storage location (Render Persistent Disk mount; set PERSIST_DIR if different)
+PERSIST_DIR   = Path(os.getenv("PERSIST_DIR", "/var/data"))
+TOKENS_PATH   = PERSIST_DIR / "tokens.json"
+PENDING_PATH  = PERSIST_DIR / "pending.json"
+
+
 # --- Simple in-memory stores ---
 BUFFER_MAX = 200
+#for storing in memory we use specialized data structure optimized "deque" for fast appends and pops from both ends
+#this is C-implemented class with internal pointers and optional maxlen.
 pending = deque(maxlen=BUFFER_MAX)          # raw callback hits (for audit)
 # tokens is nested dictionary keyed by state
 # key: state, value: {access_token, refresh_token, token_type, scope, expires_at:int}
@@ -30,6 +39,107 @@ tokens: Dict[str, Dict] = {}
 #Required for parsing the request body (JSON)
 class StatePayload(BaseModel):
     state: str
+
+# --- Persistence helpers ---
+def _ensure_persist_dir():
+    # "exists_ok=True" means that if the directory already exists, it will not do anything and not raise an error
+    PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+
+def _atomic_write_json(path: Path, data) -> None:
+    """Write JSON atomically to avoid partial writes or corrupted JSON files on crashes or restarts."""
+    _ensure_persist_dir()
+    #argument "data" can be either a deque or a plain dictionary
+    #if it is a deque, we convert it to a plain list before dumping to JSON, otherwise get error "TypeError: can't serialize deque"
+    # for that, we use built-in function "isinstance" to checks whether an object belongs to deque or not
+    if isinstance(data, deque):
+        serializable = list(data)
+    else:
+        serializable = data
+    # create a temporary file in the same directory as the target file, with the same name but with .tmp suffix
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(PERSIST_DIR), prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            # dump the serializable data to the temporary file
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+            # flush the file to ensure data is written to disk
+            # hand it off to the operating system everything you’ve written into the file object’s internal buffer
+            f.flush()
+            # ensure data is written to disk instead of RAM
+            # write everything in the OS’s cache for this file descriptor to the physical disk
+            os.fsync(f.fileno())
+        # delete old file and replace it with the temporary file atomically, then rename the temporary file to the target file name
+        os.replace(tmp_path, path)
+    # regardless of whether the operation was successful or not, we ensure the temporary file is deleted
+    finally:
+        try:
+            # check if the temporary file exists
+            if os.path.exists(tmp_path):
+                #Deletes that leftover temp file.
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+
+def _load_json_or_default(path: Path, default: Any) -> Any:
+    """Load JSON from file, returning empty dictionary if file is missing or corrupt."""
+    # try to open the file and load the JSON data from it
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError:
+        # Corrupt file: keep default but do not overwrite automatically
+        return default
+
+def save_tokens():
+    _atomic_write_json(TOKENS_PATH, tokens)
+
+def save_pending():
+    # pending is deque, so we convert it to a plain list before dumping to JSON otherwise get error "TypeError: can't serialize deque"
+    _atomic_write_json(PENDING_PATH, pending)
+
+def load_all():
+    # tokens
+    loaded_tokens = _load_json_or_default(path=TOKENS_PATH, default={})
+    # check if the loaded data is a dictionary using built-in function "isinstance"
+    if isinstance(loaded_tokens, dict):
+        # sanitize numeric fields just in case
+        # When read JSON from disk, the data might technically load fine, but may be inconsistent to use directly in memory.
+        # The iteration ensures that what you load is actually valid, type-consistent, and won’t crash your logic later.
+        for key, value in list(loaded_tokens.items()):
+            if not isinstance(value, dict):
+                # remove the key-value pair from the dictionary if the value is not a dictionary
+                loaded_tokens.pop(key, None)
+                continue
+            if "expires_at" in value:
+                try:
+                    value["expires_at"] = int(value["expires_at"])
+                except Exception:
+                    value["expires_at"] = int(time.time()) + 300    
+    else:
+        loaded_tokens = {}
+    #Removes all existing key–value pairs from the global "tokens" dictionary
+    tokens.clear()
+    #Update the global "tokens" dictionary with the loaded data
+    tokens.update(loaded_tokens)
+
+    # pending
+    loaded_pending = _load_json_or_default(path=PENDING_PATH, default=[])
+    dq = deque(maxlen=BUFFER_MAX)
+    if isinstance(loaded_pending, list):
+        dq.extend(loaded_pending[:BUFFER_MAX])
+    #Removes all existing key–value pairs from the global "pending" deque
+    pending.clear()
+    #Update the global "pending" deque with the loaded data
+    pending.extend(dq)
+
+# --- Startup hook ---
+@app.on_event("startup")
+#“Running when the application starts, before handling any incoming HTTP request
+def _startup_load_from_disk():
+    _ensure_persist_dir()
+    load_all()
+
 
 # --- Helpers ---
 async def exchange_code_for_tokens(code: str) -> Dict:
@@ -96,16 +206,30 @@ async def get_valid_access_token_for_state(state: str) -> Optional[Dict]:
     item = tokens.get(state)
     if not item:
         return None
-    # refresh tokens if "expires_at" is less than 60 seconds from the current time
-    if int(time.time()) >= int(item["expires_at"]) - 60:
-        refreshed = await refresh_with_refresh_token(item["refresh_token"])
+
+    now = int(time.time())
+    # get the expiration timestamp from the item, if not found, use 0
+    expires_at = int(item.get("expires_at", 0))
+
+    # Refresh if expiring within 60s
+    if now >= expires_at - 60:
+        refresh_token = item.get("refresh_token")
+        if not refresh_token:
+            # Can't refresh; return as-is (caller may re-auth if 401 later)
+            return item
+
+        # refresh the tokens using the refresh_token from the item
+        refreshed = await refresh_with_refresh_token(refresh_token)
         tokens[state] = {
             "access_token": refreshed["access_token"],
-            "refresh_token": refreshed.get("refresh_token", item["refresh_token"]),  # HH may rotate or not
+            "refresh_token": refreshed.get("refresh_token", refresh_token),  # HH may rotate or not
             "token_type": refreshed.get("token_type", "Bearer"),
             "expires_in": refreshed.get("expires_in"),
             "expires_at": refreshed["expires_at"],
         }
+        # save the updated tokens to disk
+        save_tokens()
+        # update the item in memory with the refreshed tokens
         item = tokens[state]
     return item
 
@@ -144,7 +268,10 @@ async def hh_callback(request: Request):
         "ts": int(time.time()),
         "ip": request.client.host if request.client else None,
     }
+    # add the item to the pending deque in memory buffer
     pending.append(item)
+    # save the pending data to disk
+    save_pending()
 
     # Immediately exchange the code -> tokens and store in memory under variable called "tokens"
     try:
@@ -158,6 +285,8 @@ async def hh_callback(request: Request):
             "expires_in": token.get("expires_in"),
             "expires_at": token["expires_at"],
         }
+        # save the updated tokens to disk
+        save_tokens()
         return PlainTextResponse("Вы успешно авторизовались в HH.ru, можете вернуться в Telegram")
     except httpx.HTTPError as e:
         # keep the pending record, but don’t store tokens
@@ -196,6 +325,8 @@ def admin_delete_state(payload: StatePayload, admin_token: Optional[str] = Heade
     #using .pop() method remove the item with key "state" and returns its value. 
     #if key is not found, returns default (None)
     existed = tokens.pop(payload.state, None)
+    # save the updated tokens to disk
+    save_tokens()
     #If a token was found and removed → "existed" is a dictionary → bool(existed) = True
     #If no token is not removed → "existed" = None → bool(existed) = False
     return {"deleted": bool(existed)} 
